@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 from flask import Flask, jsonify, make_response, render_template_string, request
 from flask_cors import CORS
@@ -58,6 +59,21 @@ def analyze_report(report_data, groq_client):
             conn.close()
 
     return ai_summary
+
+
+def extract_text_from_upload(uploaded_file):
+    file_name = (uploaded_file.filename or "").lower()
+    raw_bytes = uploaded_file.read()
+    if not raw_bytes:
+        return ""
+
+    text_extensions = {".txt", ".log", ".json", ".csv", ".xml", ".md", ".html", ".htm", ".py", ".js", ".ts", ".yaml", ".yml"}
+    extension = Path(file_name).suffix
+
+    if extension in text_extensions:
+        return raw_bytes.decode("utf-8", errors="ignore")
+
+    return raw_bytes.decode("utf-8", errors="ignore")
 
 
 app = Flask(__name__)
@@ -179,6 +195,23 @@ HOME_PAGE = """
             padding: 16px;
             min-height: 84px;
         }
+        .file-row {
+            margin-top: 16px;
+            display: grid;
+            gap: 10px;
+        }
+        input[type="file"] {
+            width: 100%;
+            border: 1px dashed rgba(148, 163, 184, 0.34);
+            border-radius: 14px;
+            padding: 14px;
+            background: rgba(2, 6, 23, 0.45);
+            color: var(--muted);
+        }
+        .hint {
+            color: var(--muted);
+            font-size: 13px;
+        }
         .meta {
             margin-top: 12px;
             color: var(--muted);
@@ -197,6 +230,11 @@ HOME_PAGE = """
         <section class="card">
             <label for="input">Nội dung cần phân tích</label>
             <textarea id="input" placeholder="Dán báo cáo bảo mật hoặc mô tả rủi ro tại đây..."></textarea>
+            <div class="file-row">
+                <label for="file">Hoặc tải file lên để phân tích</label>
+                <input id="file" type="file" />
+                <div class="hint">Hỗ trợ tốt nhất cho file văn bản như .txt, .log, .json, .csv, .xml, .md, .py, .js.</div>
+            </div>
             <div class="actions">
                 <button class="primary" onclick="analyze()">Phân tích</button>
                 <button class="secondary" onclick="fillExample()">Dùng ví dụ</button>
@@ -208,6 +246,7 @@ HOME_PAGE = """
 
     <script>
         const input = document.getElementById('input');
+        const fileInput = document.getElementById('file');
         const result = document.getElementById('result');
 
         function fillExample() {
@@ -215,7 +254,27 @@ HOME_PAGE = """
         }
 
         async function analyze() {
+            const file = fileInput.files && fileInput.files[0];
             const value = input.value.trim();
+
+            if (file) {
+                result.textContent = 'Đang tải và phân tích file...';
+                const formData = new FormData();
+                formData.append('file', file);
+
+                try {
+                    const response = await fetch('/analyze-file', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await response.json();
+                    result.textContent = data.summary || data.error || 'Không nhận được kết quả.';
+                } catch (error) {
+                    result.textContent = 'Không thể upload file: ' + error.message;
+                }
+                return;
+            }
+
             if (!value) {
                 result.textContent = 'Vui lòng nhập nội dung trước khi phân tích.';
                 return;
@@ -263,6 +322,25 @@ def handle_request():
 
     summary = analyze_report(content, groq_client)
     return jsonify({"status": "success", "summary": summary})
+
+
+@app.route("/analyze-file", methods=["POST", "OPTIONS"])
+def analyze_file():
+    if request.method == "OPTIONS":
+        return make_response(("", 204))
+
+    uploaded_file = request.files.get("file")
+    if not uploaded_file:
+        return jsonify({"error": "No file provided"}), 400
+
+    file_text = extract_text_from_upload(uploaded_file).strip()
+    if not file_text:
+        return jsonify({"error": "File is empty or could not be read"}), 400
+
+    file_name = uploaded_file.filename or "uploaded file"
+    prompt = f"Hãy phân tích file bảo mật sau đây bằng tiếng Việt. Tên file: {file_name}. Nội dung:\n{file_text}"
+    summary = analyze_report(prompt, groq_client)
+    return jsonify({"status": "success", "summary": summary, "filename": file_name})
 
 
 if __name__ == "__main__":
