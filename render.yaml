@@ -11,7 +11,11 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: DATABASE_URL
+        sync: false
       - key: GROQ_API_KEY
         sync: false
-      - key: DATABASE_URL
+      - key: HF_TOKEN
+        sync: false
+      - key: NGROK_AUTH_TOKEN
         sync: false
