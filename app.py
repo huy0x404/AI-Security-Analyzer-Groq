@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from flask import Flask, jsonify, make_response, render_template_string, request
 from flask_cors import CORS
@@ -20,13 +21,34 @@ def create_groq_client():
     return Groq(api_key=api_key)
 
 
+def with_sslmode_require(database_url):
+    parsed = urlparse(database_url)
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    keys = {k.lower() for k, _ in query_pairs}
+    if "sslmode" in keys:
+        return database_url
+    query_pairs.append(("sslmode", "require"))
+    return urlunparse(parsed._replace(query=urlencode(query_pairs)))
+
+
 def get_db_connection():
     database_url = os.getenv("DATABASE_URL")
     if not database_url or psycopg2 is None:
         return None
+
     try:
         return psycopg2.connect(database_url)
-    except Exception:
+    except Exception as first_error:
+        # Neon often requires sslmode=require; retry once if URL has no sslmode.
+        try:
+            fallback_url = with_sslmode_require(database_url)
+            if fallback_url != database_url:
+                return psycopg2.connect(fallback_url)
+        except Exception:
+            pass
+
+        print("DB connection failed:", first_error)
+        traceback.print_exc()
         return None
 
 
@@ -76,7 +98,7 @@ def save_report(report_data, summary, source_type="text", filename=None):
 def get_recent_reports(limit=5):
     conn = get_db_connection()
     if not conn:
-        return []
+        return None
 
     try:
         ensure_reports_table(conn)
@@ -101,7 +123,7 @@ def get_recent_reports(limit=5):
     except Exception:
         print("Error fetching recent reports:")
         traceback.print_exc()
-        return []
+        return None
     finally:
         conn.close()
 
@@ -437,6 +459,8 @@ HOME_PAGE = """
                     result.textContent = data.summary || data.error || 'Không nhận được kết quả.';
                     if (data.report_id) {
                         reportMeta.textContent = 'Đã lưu report ID: #' + data.report_id;
+                    } else if (data.db_saved === false) {
+                        reportMeta.textContent = 'Phân tích xong nhưng chưa lưu DB: ' + (data.db_error || 'Lỗi không xác định');
                     }
                     await refreshHistory();
                 } catch (error) {
@@ -461,6 +485,8 @@ HOME_PAGE = """
                 result.textContent = data.summary || data.error || 'Không nhận được kết quả.';
                 if (data.report_id) {
                     reportMeta.textContent = 'Đã lưu report ID: #' + data.report_id;
+                } else if (data.db_saved === false) {
+                    reportMeta.textContent = 'Phân tích xong nhưng chưa lưu DB: ' + (data.db_error || 'Lỗi không xác định');
                 }
                 await refreshHistory();
             } catch (error) {
@@ -475,6 +501,10 @@ HOME_PAGE = """
 
             try {
                 const response = await fetch('/reports/recent?limit=5');
+                if (!response.ok) {
+                    const errData = await response.json().catch(() => ({}));
+                    throw new Error(errData.error || 'Không truy cập được database');
+                }
                 const data = await response.json();
                 const items = data.items || [];
 
@@ -486,14 +516,14 @@ HOME_PAGE = """
                 for (const item of items) {
                     const btn = document.createElement('button');
                     btn.className = 'history-item';
-                    const fileInfo = item.filename ? (' | file: ' + item.filename) : '';
-                    btn.innerHTML = 'Report #' + item.id + '<small>' + item.source_type + fileInfo + '</small>';
+                    const createdAt = item.created_at ? new Date(item.created_at).toLocaleString('vi-VN') : 'Không rõ thời gian';
+                    btn.innerHTML = 'Report #' + item.id + '<small>' + createdAt + '</small>';
                     btn.onclick = () => loadReport(item.id);
                     historyList.appendChild(btn);
                 }
             } catch (error) {
                 historyEmpty.style.display = 'block';
-                historyEmpty.textContent = 'Không tải được lịch sử report.';
+                historyEmpty.textContent = 'Không tải được lịch sử report: ' + error.message;
             }
         }
 
@@ -562,7 +592,16 @@ def handle_request():
         return jsonify({"error": "No data provided"}), 400
 
     summary, report_id = analyze_report(content, groq_client, source_type="text")
-    return jsonify({"status": "success", "summary": summary, "report_id": report_id})
+    db_saved = report_id is not None
+    return jsonify(
+        {
+            "status": "success" if db_saved else "partial",
+            "summary": summary,
+            "report_id": report_id,
+            "db_saved": db_saved,
+            "db_error": None if db_saved else "Could not save report to database",
+        }
+    )
 
 
 @app.route("/analyze-file", methods=["POST", "OPTIONS"])
@@ -581,7 +620,17 @@ def analyze_file():
     file_name = uploaded_file.filename or "uploaded file"
     prompt = f"Hãy phân tích file bảo mật sau đây bằng tiếng Việt. Tên file: {file_name}. Nội dung:\n{file_text}"
     summary, report_id = analyze_report(prompt, groq_client, source_type="file", filename=file_name)
-    return jsonify({"status": "success", "summary": summary, "filename": file_name, "report_id": report_id})
+    db_saved = report_id is not None
+    return jsonify(
+        {
+            "status": "success" if db_saved else "partial",
+            "summary": summary,
+            "filename": file_name,
+            "report_id": report_id,
+            "db_saved": db_saved,
+            "db_error": None if db_saved else "Could not save report to database",
+        }
+    )
 
 
 @app.get("/reports/recent")
@@ -592,6 +641,8 @@ def reports_recent():
     if limit > 20:
         limit = 20
     items = get_recent_reports(limit=limit)
+    if items is None:
+        return jsonify({"status": "error", "error": "Database unavailable or query failed"}), 503
     return jsonify({"status": "success", "items": items})
 
 
