@@ -4,6 +4,8 @@ from pathlib import Path
 from flask import Flask, jsonify, make_response, render_template_string, request
 from flask_cors import CORS
 from groq import Groq
+import traceback
+
 
 try:
     import psycopg2
@@ -33,12 +35,10 @@ def ensure_reports_table(conn):
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS reports (
-                id BIGSERIAL PRIMARY KEY,
+                id SERIAL PRIMARY KEY,
                 report_data TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                source_type VARCHAR(20) NOT NULL DEFAULT 'text',
-                filename TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                summary TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
@@ -55,17 +55,19 @@ def save_report(report_data, summary, source_type="text", filename=None):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO reports (report_data, summary, source_type, filename)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO reports (report_data, summary)
+                VALUES (%s, %s)
                 RETURNING id;
                 """,
-                (str(report_data), summary, source_type, filename),
+                (str(report_data), summary),
             )
             report_id = cur.fetchone()[0]
             conn.commit()
             return report_id
     except Exception:
         conn.rollback()
+        print("Error saving report:")
+        traceback.print_exc()
         return None
     finally:
         conn.close()
@@ -81,7 +83,7 @@ def get_recent_reports(limit=5):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, source_type, filename, created_at
+                SELECT id, created_at
                 FROM reports
                 ORDER BY id DESC
                 LIMIT %s;
@@ -92,13 +94,13 @@ def get_recent_reports(limit=5):
             return [
                 {
                     "id": row[0],
-                    "source_type": row[1],
-                    "filename": row[2],
-                    "created_at": row[3].isoformat() if row[3] else None,
+                    "created_at": row[1].isoformat() if row[1] else None,
                 }
                 for row in rows
             ]
     except Exception:
+        print("Error fetching recent reports:")
+        traceback.print_exc()
         return []
     finally:
         conn.close()
@@ -114,7 +116,7 @@ def get_report_by_id(report_id):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, report_data, summary, source_type, filename, created_at
+                SELECT id, report_data, summary, created_at
                 FROM reports
                 WHERE id = %s;
                 """,
@@ -127,33 +129,46 @@ def get_report_by_id(report_id):
                 "id": row[0],
                 "report_data": row[1],
                 "summary": row[2],
-                "source_type": row[3],
-                "filename": row[4],
-                "created_at": row[5].isoformat() if row[5] else None,
+                "created_at": row[3].isoformat() if row[3] else None,
             }
     except Exception:
+        print(f"Error fetching report {report_id}:")
+        traceback.print_exc()
         return None
     finally:
         conn.close()
 
 
 def analyze_report(report_data, groq_client, source_type="text", filename=None):
-    if not groq_client:
-        return "Error: GROQ_API_KEY is not configured."
-
+    # If Groq client is not configured, we still save the input and a fallback summary
     prompt = f"Hãy phân tích báo cáo quét bảo mật sau đây bằng tiếng Việt: {report_data}"
-    try:
-        completion = groq_client.chat.completions.create(
-            model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5,
-            max_tokens=1024,
-        )
-        ai_summary = completion.choices[0].message.content
-    except Exception as exc:
-        ai_summary = f"Groq Analysis failed: {exc}"
+    ai_summary = None
 
-    report_id = save_report(report_data, ai_summary, source_type=source_type, filename=filename)
+    if groq_client:
+        try:
+            completion = groq_client.chat.completions.create(
+                model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.5,
+                max_tokens=1024,
+            )
+            ai_summary = completion.choices[0].message.content
+        except Exception as exc:
+            ai_summary = f"Groq Analysis failed: {exc}"
+            print("Groq failure:\n", exc)
+            traceback.print_exc()
+    else:
+        ai_summary = "Groq not configured: saved raw report as summary."
+
+    report_id = None
+    try:
+        report_id = save_report(report_data, ai_summary, source_type=source_type, filename=filename)
+        if report_id is None:
+            print("Warning: save_report returned None (report not saved).")
+    except Exception as e:
+        print("Exception while saving report:", e)
+        traceback.print_exc()
+
     return ai_summary, report_id
 
 
