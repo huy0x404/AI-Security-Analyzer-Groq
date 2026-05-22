@@ -9,9 +9,15 @@ import traceback
 
 
 try:
-    import psycopg2
+    import psycopg2 as db_driver
+    DB_DRIVER_NAME = "psycopg2"
 except Exception:
-    psycopg2 = None
+    try:
+        import psycopg as db_driver
+        DB_DRIVER_NAME = "psycopg"
+    except Exception:
+        db_driver = None
+        DB_DRIVER_NAME = None
 
 
 LAST_DB_ERROR = None
@@ -40,12 +46,12 @@ def get_db_connection():
     if not database_url:
         LAST_DB_ERROR = "DATABASE_URL is not set"
         return None
-    if psycopg2 is None:
-        LAST_DB_ERROR = "psycopg2 is not installed/importable"
+    if db_driver is None:
+        LAST_DB_ERROR = "No supported PostgreSQL driver installed (psycopg2/psycopg)"
         return None
 
     try:
-        conn = psycopg2.connect(database_url)
+        conn = db_driver.connect(database_url)
         LAST_DB_ERROR = None
         return conn
     except Exception as first_error:
@@ -53,7 +59,7 @@ def get_db_connection():
         try:
             fallback_url = with_sslmode_require(database_url)
             if fallback_url != database_url:
-                conn = psycopg2.connect(fallback_url)
+                conn = db_driver.connect(fallback_url)
                 LAST_DB_ERROR = None
                 return conn
         except Exception:
@@ -579,7 +585,8 @@ def db_health():
         database_url = os.getenv("DATABASE_URL")
         diagnostics = {
             "database_url_present": bool(database_url),
-            "psycopg2_available": psycopg2 is not None,
+            "db_driver": DB_DRIVER_NAME,
+            "db_driver_available": db_driver is not None,
         }
         conn = get_db_connection()
         if conn:
