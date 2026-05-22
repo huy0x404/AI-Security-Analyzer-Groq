@@ -14,6 +14,9 @@ except Exception:
     psycopg2 = None
 
 
+LAST_DB_ERROR = None
+
+
 def create_groq_client():
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
@@ -32,23 +35,33 @@ def with_sslmode_require(database_url):
 
 
 def get_db_connection():
+    global LAST_DB_ERROR
     database_url = os.getenv("DATABASE_URL")
-    if not database_url or psycopg2 is None:
+    if not database_url:
+        LAST_DB_ERROR = "DATABASE_URL is not set"
+        return None
+    if psycopg2 is None:
+        LAST_DB_ERROR = "psycopg2 is not installed/importable"
         return None
 
     try:
-        return psycopg2.connect(database_url)
+        conn = psycopg2.connect(database_url)
+        LAST_DB_ERROR = None
+        return conn
     except Exception as first_error:
         # Neon often requires sslmode=require; retry once if URL has no sslmode.
         try:
             fallback_url = with_sslmode_require(database_url)
             if fallback_url != database_url:
-                return psycopg2.connect(fallback_url)
+                conn = psycopg2.connect(fallback_url)
+                LAST_DB_ERROR = None
+                return conn
         except Exception:
             pass
 
         print("DB connection failed:", first_error)
         traceback.print_exc()
+        LAST_DB_ERROR = str(first_error)
         return None
 
 
@@ -563,6 +576,11 @@ def db_health():
     """Attempt a single DB connection and report status. Useful for debugging DATABASE_URL connectivity."""
     conn = None
     try:
+        database_url = os.getenv("DATABASE_URL")
+        diagnostics = {
+            "database_url_present": bool(database_url),
+            "psycopg2_available": psycopg2 is not None,
+        }
         conn = get_db_connection()
         if conn:
             try:
@@ -573,9 +591,16 @@ def db_health():
                 version = None
             finally:
                 conn.close()
-            return jsonify({"db": "connected", "version": version}), 200
+            return jsonify({"db": "connected", "version": version, "diagnostics": diagnostics}), 200
         else:
-            return jsonify({"db": "unavailable", "error": "Could not establish connection (no DATABASE_URL or psycopg2 missing)"}), 503
+            return jsonify(
+                {
+                    "db": "unavailable",
+                    "error": "Could not establish connection",
+                    "details": LAST_DB_ERROR,
+                    "diagnostics": diagnostics,
+                }
+            ), 503
     except Exception as e:
         return jsonify({"db": "error", "error": str(e)}), 500
 
@@ -642,7 +667,7 @@ def reports_recent():
         limit = 20
     items = get_recent_reports(limit=limit)
     if items is None:
-        return jsonify({"status": "error", "error": "Database unavailable or query failed"}), 503
+        return jsonify({"status": "error", "error": "Database unavailable or query failed", "details": LAST_DB_ERROR}), 503
     return jsonify({"status": "success", "items": items})
 
 
